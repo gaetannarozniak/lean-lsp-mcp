@@ -4,6 +4,7 @@ import logging.config
 import os
 import re
 import ssl
+import subprocess
 import time
 import urllib
 import uuid
@@ -298,6 +299,272 @@ def rate_limited(category: str, max_requests: int, per_seconds: int):
         return wrapper
 
     return decorator
+
+def validate_block_integrity(patch_content):
+    """
+    Validate the integrity of patch blocks before parsing.
+    Checks for balanced markers and correct sequence.
+    """
+    # Check marker balance
+    search_count = patch_content.count("<<<<<<< SEARCH")
+    separator_count = patch_content.count("=======")
+    replace_count = patch_content.count(">>>>>>> REPLACE")
+    
+    if not (search_count == separator_count == replace_count):
+        raise ValueError(
+            f"Malformed patch format: Unbalanced markers - "
+            f"{search_count} SEARCH, {separator_count} separator, {replace_count} REPLACE markers"
+        )
+
+    # Check marker sequence
+    markers = []
+    for line in patch_content.splitlines():
+        line = line.strip()
+        if line in ["<<<<<<< SEARCH", "=======", ">>>>>>> REPLACE"]:
+            markers.append(line)
+    
+    # Verify correct marker sequence (always SEARCH, SEPARATOR, REPLACE pattern)
+    for i in range(0, len(markers), 3):
+        if i+2 < len(markers):
+            if markers[i] != "<<<<<<< SEARCH" or markers[i+1] != "=======" or markers[i+2] != ">>>>>>> REPLACE":
+                raise ValueError(
+                    f"Malformed patch format: Incorrect marker sequence at position {i}: "
+                    f"Expected [SEARCH, SEPARATOR, REPLACE], got {markers[i:i+3]}"
+                )
+    
+    # Check for nested markers in each block
+    sections = patch_content.split("<<<<<<< SEARCH")
+    for i, section in enumerate(sections[1:], 1):  # Skip first empty section
+        if "<<<<<<< SEARCH" in section and section.find(">>>>>>> REPLACE") > section.find("<<<<<<< SEARCH"):
+            raise ValueError(f"Malformed patch format: Nested SEARCH marker in block {i}")
+
+def parse_search_replace_blocks(patch_content):
+    """
+    Parse multiple search-replace blocks from the patch content.
+    Returns a list of tuples (search_text, replace_text).
+    """
+    # Define the markers
+    search_marker = "<<<<<<< SEARCH"
+    separator = "======="
+    replace_marker = ">>>>>>> REPLACE"
+    
+    # First validate patch integrity
+    validate_block_integrity(patch_content)
+
+    # Use regex to extract all blocks
+    pattern = f"{search_marker}\\n(.*?)\\n{separator}\\n(.*?)\\n{replace_marker}"
+    matches = re.findall(pattern, patch_content, re.DOTALL)
+
+    if not matches:
+        # Try alternative parsing if regex fails
+        blocks = []
+        lines = patch_content.splitlines()
+        i = 0
+        while i < len(lines):
+            if lines[i] == search_marker:
+                search_start = i + 1
+                separator_idx = -1
+                replace_end = -1
+
+                # Find the separator
+                for j in range(search_start, len(lines)):
+                    if lines[j] == separator:
+                        separator_idx = j
+                        break
+
+                if separator_idx == -1:
+                    raise ValueError("Invalid format: missing separator")
+
+                # Find the replace marker
+                for j in range(separator_idx + 1, len(lines)):
+                    if lines[j] == replace_marker:
+                        replace_end = j
+                        break
+
+                if replace_end == -1:
+                    raise ValueError("Invalid format: missing replace marker")
+
+                search_text = "\n".join(lines[search_start:separator_idx])
+                replace_text = "\n".join(lines[separator_idx + 1:replace_end])
+                
+                # Check for markers in the search or replace text
+                if any(marker in search_text for marker in [search_marker, separator, replace_marker]):
+                    raise ValueError(f"Block {len(blocks)+1}: Search text contains patch markers")
+                if any(marker in replace_text for marker in [search_marker, separator, replace_marker]):
+                    raise ValueError(f"Block {len(blocks)+1}: Replace text contains patch markers")
+                
+                blocks.append((search_text, replace_text))
+
+                i = replace_end + 1
+            else:
+                i += 1
+
+        if blocks:
+            return blocks
+        else:
+            raise ValueError("Invalid patch format. Expected block format with SEARCH/REPLACE markers.")
+
+    # Check for markers in matched content
+    for i, (search_text, replace_text) in enumerate(matches):
+        if any(marker in search_text for marker in [search_marker, separator, replace_marker]):
+            raise ValueError(f"Block {i+1}: Search text contains patch markers")
+        if any(marker in replace_text for marker in [search_marker, separator, replace_marker]):
+            raise ValueError(f"Block {i+1}: Replace text contains patch markers")
+
+    return matches
+
+@mcp.tool("lean_apply_diff")
+def lean_apply_diff(
+    file_path: str = Field(description="The path to the file to patch"),
+    patch_content: str = Field(
+        description="Content to search and replace in the file using block format with SEARCH/REPLACE markers. Multiple blocks are supported.")
+):
+    """
+    Update the file by applying a patch/edit to it using block format.
+    You can include multiple search-replace blocks in a single request.
+    Required format:
+    ```
+    <<<<<<< SEARCH
+    First text to find
+    =======
+    First replacement
+    >>>>>>> REPLACE
+    <<<<<<< SEARCH
+    Second text to find
+    =======
+    Second replacement
+    >>>>>>> REPLACE
+    ```
+    """
+    pp = Path(file_path).resolve()
+    if not pp.exists() or not pp.is_file():
+        raise FileNotFoundError(f"File {file_path} does not exist")
+    lean_project_path_str = os.environ.get("LEAN_PROJECT_PATH", "").strip()
+    if lean_project_path_str == "":
+        return "Error: the LEAN_PROJECT_PATH environment variable is not defined"
+    allowed_directory = Path(lean_project_path_str) / "model_generated_files"
+    if not str(pp).startswith(str(allowed_directory)):
+        raise PermissionError(f"File {file_path} is not in allowed directory")
+
+    # Read the current file content
+    with open(pp, 'r', encoding='utf-8') as f:
+        original_content = f.read()
+
+    try:
+        # Parse multiple search-replace blocks
+        blocks = parse_search_replace_blocks(patch_content)
+        if not blocks:
+            raise ValueError("No valid search-replace blocks found in the patch content")
+
+        # Apply each block sequentially
+        current_content = original_content
+        applied_blocks = 0
+
+        for i, (search_text, replace_text) in enumerate(blocks):
+            print(f"Processing block {i+1}/{len(blocks)}")
+
+            # Check exact match count
+            count = current_content.count(search_text)
+
+            if count == 1:
+                # Exactly one match - perfect!
+                current_content = current_content.replace(search_text, replace_text)
+                applied_blocks += 1
+
+            elif count > 1:
+                # Multiple matches - too ambiguous
+                raise ValueError(f"Block {i+1}: The search text appears {count} times in the file. "
+                                 "Please provide more context to identify the specific occurrence.")
+
+            else:
+                # No match found
+                raise ValueError(f"Block {i+1}: Could not find the search text in the file. "
+                                 "Please ensure the search text exactly matches the content in the file.")
+
+        # Write the final content back to the file
+        with open(pp, 'w', encoding='utf-8') as f:
+            f.write(current_content)
+
+        return f"Successfully applied {applied_blocks} patch blocks to {file_path}"
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to apply patch: {str(e)}")
+
+@mcp.tool("lean_regex_in_file")
+def lean_regex_in_file(
+    file_path: str,
+    regex: str,
+    context_lines: int
+) -> dict:
+    """
+    Search a file using a regex and return all matches with surrounding context lines.
+    """
+
+    # Validate file existence
+    path = Path(file_path)
+    if not path.exists() or not path.is_file():
+        return {"success": False, "error": f"Invalid file: {file_path}", "matches": []}
+
+    # Compile regex (case sensitive)
+    try:
+        pattern = re.compile(regex)
+    except re.error as e:
+        return {"success": False, "error": f"Invalid regex: {str(e)}", "matches": []}
+
+    # Read file lines
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        return {"success": False, "error": f"Error reading file: {str(e)}", "matches": []}
+
+    results = []
+    for idx, line in enumerate(lines):
+        if pattern.search(line):
+            # Determine context range
+            start = max(0, idx - context_lines)
+            end = min(len(lines), idx + context_lines + 1)
+
+            results.append({
+                "line_number": idx + 1,
+                "matched_line": line,
+                "context_before": lines[start:idx],
+                "context_after": lines[idx+1:end],
+            })
+
+    return {"success": True, "matches": results}
+
+@mcp.tool("lean_write_file")
+async def lean_write_file(text: str, name: str) -> str:
+    """Writes a file into the Lean project directory"""
+
+    if not name.endswith(".lean"):
+        name += ".lean"
+
+    lean_project_path_str = os.environ.get("LEAN_PROJECT_PATH", "").strip()
+    if lean_project_path_str == "":
+        return "Error: the LEAN_PROJECT_PATH environment variable is not defined"
+
+    base_dir = Path(lean_project_path_str) / "model_generated_files"
+
+    # Split name into directory + filename
+    name_path = Path(name)
+    parent_dir = base_dir / name_path.parent
+    stem = name_path.stem
+    suffix = name_path.suffix  # ".lean"
+    parent_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find a free filename
+    target_path = parent_dir / name_path.name
+    i = 1
+    while target_path.exists():
+        target_path = parent_dir / f"{stem}{i}{suffix}"
+        i += 1
+
+    try:
+        target_path.write_text(text, encoding="utf-8")
+        return f"Successfully wrote to Lean project: {target_path.absolute()}"
+    except Exception as e:
+        return f"Failed to write to project: {str(e)}"
 
 
 @mcp.tool(
