@@ -442,7 +442,7 @@ def lean_apply_diff(
     lean_project_path_str = os.environ.get("LEAN_PROJECT_PATH", "").strip()
     if lean_project_path_str == "":
         return "Error: the LEAN_PROJECT_PATH environment variable is not defined"
-    allowed_directory = Path(lean_project_path_str) / "model_generated_files"
+    allowed_directory = Path(lean_project_path_str)
     if not str(pp).startswith(str(allowed_directory)):
         raise PermissionError(f"File {file_path} is not in allowed directory")
 
@@ -533,8 +533,20 @@ def lean_regex_in_file(
 
     return {"success": True, "matches": results}
 
-@mcp.tool("lean_write_file")
-async def lean_write_file(text: str, name: str) -> str:
+@mcp.tool(
+    "lean_write_file",
+    annotations=ToolAnnotations(
+        title="Write file",
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def lean_write_file(
+    ctx: Context,
+    text: Annotated[str, Field(description="Lean code, the content of the file")],
+    name: Annotated[str, Field(description="An explicit name for the created file")],
+) -> str:
     """Writes a file into the Lean project directory"""
 
     if not name.endswith(".lean"):
@@ -544,7 +556,7 @@ async def lean_write_file(text: str, name: str) -> str:
     if lean_project_path_str == "":
         return "Error: the LEAN_PROJECT_PATH environment variable is not defined"
 
-    base_dir = Path(lean_project_path_str) / "model_generated_files"
+    base_dir = Path(lean_project_path_str) / "LeanProject/model_generated_files"
 
     # Split name into directory + filename
     name_path = Path(name)
